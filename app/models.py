@@ -867,3 +867,73 @@ class ExposureResponse(BaseModel):
             " is zero (no valid sample anywhere in the interval)"
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# read-only local spike detection
+# ---------------------------------------------------------------------------
+
+class LocalSpikeOut(BaseModel):
+    observed_at: str = Field(
+        ..., description="Event time of the spiking published reading"
+    )
+    seq: int = Field(..., description="Per-source sequence number of the reading")
+    value: float = Field(..., description="The reading's finite numeric value")
+    local_median: float = Field(
+        ...,
+        description="Median of the other valid readings within the time window",
+    )
+    mad: float = Field(
+        ...,
+        description=(
+            "Median absolute deviation of the neighbour values around"
+            " local_median (may be 0)"
+        ),
+    )
+    deviation: float = Field(
+        ...,
+        description="Absolute difference between value and local_median",
+    )
+
+
+class LocalSpikesResponse(BaseModel):
+    session_id: str
+    source_id: str
+    from_: str = Field(
+        ...,
+        validation_alias="from",
+        serialization_alias="from",
+        description="Normalised UTC form of the closed interval start (inclusive)",
+    )
+    to: str = Field(
+        ..., description="Normalised UTC form of the closed interval end (inclusive)"
+    )
+    window_seconds: float = Field(..., description="Neighbourhood radius in seconds")
+    sensitivity: float = Field(
+        ..., description="Strict multiplier applied to the MAD"
+    )
+    value_key: Optional[str] = Field(
+        None,
+        description="Top-level key read from object-valued readings; null compares value itself",
+    )
+    valid_readings: int = Field(
+        ...,
+        description=(
+            "Published readings in the closed interval with a finite,"
+            " non-boolean numeric value"
+        ),
+    )
+    insufficient_neighbours: int = Field(
+        ...,
+        description=(
+            "Valid readings with fewer than 3 other valid readings inside the"
+            " window, which were not judged"
+        ),
+    )
+    spikes: list[LocalSpikeOut] = Field(
+        ...,
+        description=(
+            "Readings whose deviation is strictly greater than sensitivity * MAD,"
+            " ordered by (observed_at, seq)"
+        ),
+    )

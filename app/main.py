@@ -14,6 +14,7 @@ from . import (
     checkpoints,
     correlated,
     exposure,
+    local_spikes,
     quarantine_audit,
     release_plan,
     retention,
@@ -41,6 +42,7 @@ from .models import (
     CurrentAlertsResponse,
     CurrentCorrelatedAlertsResponse,
     ExposureResponse,
+    LocalSpikesResponse,
     PullResponse,
     QuarantineAuditResponse,
     QuarantineResponse,
@@ -94,7 +96,11 @@ app = FastAPI(
         "a source's piecewise-constant published timeline inside a half-open "
         "[from, to) interval that are strictly above a threshold, alongside "
         "the valid-sample coverage and unknown seconds (missing, non-finite "
-        "and boolean values do not carry an older value over)."
+        "and boolean values do not carry an older value over). A read-only"
+        " local-spikes endpoint flags, in one snapshot, a source's published"
+        " readings inside a closed event-time interval whose deviation from"
+        " the median of their time-windowed neighbours is strictly greater"
+        " than a sensitivity multiple of the neighbours' MAD."
     ),
     lifespan=lifespan,
 )
@@ -396,6 +402,80 @@ def get_source_exposure(
             from_=from_,
             to=to,
             threshold=threshold,
+            value_key=value_key,
+        )
+    )
+
+
+@app.get(
+    "/sessions/{session_id}/local-spikes",
+    response_model=LocalSpikesResponse,
+    tags=["readings"],
+)
+def get_local_spikes(
+    session_id: str,
+    source_id: Optional[str] = Query(
+        None, description="One declared source of the session to analyse"
+    ),
+    from_: Optional[str] = Query(
+        None,
+        alias="from",
+        description="Inclusive event-time interval start (ISO 8601)",
+    ),
+    to: Optional[str] = Query(
+        None, description="Inclusive event-time interval end (ISO 8601)"
+    ),
+    window_seconds: Optional[str] = Query(
+        None,
+        description=(
+            "Positive neighbourhood radius in seconds: other valid readings"
+            " at most this far away in event time are neighbours"
+        ),
+    ),
+    sensitivity: Optional[str] = Query(
+        None,
+        description=(
+            "Positive strict multiplier on the neighbours' MAD; a reading is a"
+            " spike when deviation is strictly greater than sensitivity * MAD"
+        ),
+    ),
+    value_key: Optional[str] = Query(
+        None,
+        description="Top-level key read from object-valued readings (default: value itself)",
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> LocalSpikesResponse:
+    """Read-only robust local spike detection on one source's published readings.
+
+    Inside one SQLite read snapshot, the source's published readings in the
+    closed interval ``[from, to]`` are analysed in stable
+    ``(observed_at, seq)`` order.  Only finite, non-boolean numbers
+    participate (optionally read from a top-level object key); missing and
+    non-finite values are skipped.  Each valid reading uses the other valid
+    readings whose event-time distance is at most ``window_seconds`` as
+    neighbours.  With fewer than three neighbours it is not judged;
+    otherwise the neighbour median and MAD are computed and the reading is a
+    spike when its absolute deviation from the median is strictly greater
+    than ``sensitivity * MAD`` (a zero MAD still flags any strictly positive
+    deviation).  The response lists each spike's key, value, local median,
+    MAD and deviation, plus the valid-reading count and the count left
+    unjudged for lack of neighbours.  An interval with more than 200
+    published readings returns 422.  Buffered/quarantined readings never
+    participate and nothing is written.  An invalid interval, non-positive
+    parameters or an unknown source return 400; an unknown session returns
+    404.
+    """
+    # Every parameter error must be 400 (not FastAPI's default 422), so the
+    # query params are parsed/validated inside the module, like exposure.
+    return LocalSpikesResponse(
+        **local_spikes.local_spikes(
+            conn,
+            session_id,
+            source_id=source_id,
+            from_=from_,
+            to=to,
+            window_seconds=window_seconds,
+            sensitivity=sensitivity,
             value_key=value_key,
         )
     )
