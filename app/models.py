@@ -867,3 +867,83 @@ class ExposureResponse(BaseModel):
             " is zero (no valid sample anywhere in the interval)"
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# read-only local-spike detection (neighbour median + MAD)
+# ---------------------------------------------------------------------------
+
+class LocalSpikeKeyOut(TimelineKeyOut):
+    """Key of a published reading flagged as a local spike."""
+
+
+class LocalSpikeOut(BaseModel):
+    key: LocalSpikeKeyOut = Field(
+        ..., description="Published reading key (observed_at, source_id, seq)"
+    )
+    value: float = Field(..., description="The reading's finite numeric value")
+    local_median: float = Field(
+        ...,
+        description="Median of the in-window neighbour values (excluding this reading)",
+    )
+    mad: float = Field(
+        ...,
+        description=(
+            "Median absolute deviation of the neighbours from local_median;"
+            " zero when every neighbour equals the median"
+        ),
+    )
+    deviation: float = Field(
+        ..., description="Absolute difference |value - local_median|"
+    )
+
+
+class LocalSpikesResponse(BaseModel):
+    session_id: str
+    source_id: str
+    from_: str = Field(
+        ...,
+        validation_alias="from",
+        serialization_alias="from",
+        description="Normalised UTC form of the inclusive interval start",
+    )
+    to: str = Field(
+        ..., description="Normalised UTC form of the inclusive interval end"
+    )
+    window_seconds: float = Field(
+        ..., description="Inclusive event-time neighbour window (strictly positive)"
+    )
+    sensitivity: float = Field(
+        ...,
+        description="Strictly positive coefficient; a reading spikes when deviation > sensitivity * MAD",
+    )
+    value_key: Optional[str] = Field(
+        None,
+        description="Top-level key read from object-valued readings; null compares value itself",
+    )
+    readings_count: int = Field(
+        ...,
+        description=(
+            "Published readings of the source inside [from, to] in the snapshot,"
+            " before valid-value filtering; requests with more than 200 fail"
+        ),
+    )
+    valid_count: int = Field(
+        ...,
+        description="Readings with a finite non-boolean numeric value, ordered (observed_at, seq)",
+    )
+    insufficient_neighbors_count: int = Field(
+        ...,
+        description=(
+            "Valid readings left undecided because they have fewer than three"
+            " other valid readings within the event-time window"
+        ),
+    )
+    spikes: list[LocalSpikeOut] = Field(
+        ...,
+        description=(
+            "Readings whose absolute deviation from the local neighbour median"
+            " is strictly greater than sensitivity times the neighbour MAD,"
+            " ordered (observed_at, seq)"
+        ),
+    )

@@ -57,6 +57,16 @@ buffered 读数按既定全局顺序一次性发布（**尾流发布**）、推�
 终点；区间起点继承此前最近读数；同一时刻多条读数按 `seq` 顺序、最后一条生效。缺值、
 非有限数值与布尔值形成未知区间，不沿用更早的有效值，起点前无读数同样未知。
 
+此外，**局部尖峰分析**接口 `GET /sessions/{session_id}/local-spikes` 在**同一个 SQLite
+读快照**内只按指定来源的**已发布**读数，在事件时间**闭区间** `[from, to]` 内按
+`(observed_at, seq)` 稳定排序后做局部中位数/MAD 异常检测：仅有限非布尔数值参与
+（可用 `value_key` 从对象值提取指定顶层键，布尔值与缺失值跳过），每条有效读数只以区间内
+事件时间距离不超过 `window_seconds`（正数、边界含等号）的**其他**有效读数为邻居；邻居
+少于 3 条不判定，否则取邻居中位数与绝对偏差中位数（MAD），仅当读数与中位数的绝对差
+**严格大于** `sensitivity`（正数）乘 MAD 时标记为尖峰（MAD 为零时仍按严格大于零判断）。
+响应给出每个尖峰的读数键、数值、局部中位数、MAD 与偏差，并列出有效读数数与邻居不足数；
+区间内已发布读数超过 200 条直接报错。
+
 - 语言/框架：Python 3.11 · FastAPI · Uvicorn
 - 存储：SQLite（WAL 模式，单文件，零外部依赖）
 - 并发：写操作在 `BEGIN IMMEDIATE` 事务内串行化，水位线推进单调、发布只发生一次，
@@ -94,7 +104,7 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 334 个端到端行为测试（需 pytest、httpx）
+pytest -q        # 运行 386 个端到端行为测试（需 pytest、httpx）
 ```
 
 ## 时间线语义
@@ -897,6 +907,84 @@ UTC 形式（如 `...T12:00:00+02:00` 回显为 `...T10:00:00Z`，不带时区�
 - 错误码：会话不存在 → 404；缺少/非法 `source_id`、未声明来源、非法 `from`/`to`、
   `from >= to`（空或反向区间）、缺少/非有限 `threshold`、空白 `value_key` → 400。
 
+### 24. 局部尖峰分析（只读）
+
+`GET /sessions/{session_id}/local-spikes`
+
+只看会话内**某个来源**的**已发布**读数，在事件时间**闭区间** `[from, to]`（两端含等号）
+内做局部“邻居中位数 + MAD”尖峰检测。`buffered` 与 `quarantined` 读数永不参与。
+
+查询参数（全部通过 query string 传递）：
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `source_id` | 是 | 只分析该来源；须为会话已声明来源，否则 400 |
+| `from` | 是 | 区间起点（**含等号**，ISO 8601，统一按 UTC 归一化）；`observed_at >= from` |
+| `to` | 是 | 区间终点（**含等号**，同上）；`observed_at <= to`；`from` 晚于 `to` → 400（`from == to` 的点区间合法） |
+| `window_seconds` | 是 | 邻居窗口（秒，**严格为正**的有限数；零、负数、NaN/Infinity → 400） |
+| `sensitivity` | 是 | 灵敏度系数（**严格为正**的有限数，同上）；判定阈值为 `sensitivity * MAD` |
+| `value_key` | 否 | 从对象型读数中取该顶层键；省略则直接比较读数 `value`；空白 → 400 |
+
+**有效读数与稳定排序**：区间内读数按 `(observed_at, seq)` 稳定排序（同一事件时刻按
+`seq` 破并）。只有**有限的非布尔数值**参与：给了 `value_key` 时从对象型读数读取该顶层键，
+键缺失、值为布尔/字符串/`null`/NaN/Infinity，或读数本身不是带该键的对象，一律跳过；
+不给 `value_key` 时读数 `value` 本身须为有限非布尔数值。被跳过的读数既不是候选也不是
+邻居。
+
+**邻居与判定**：对每条有效读数，其邻居是**区间内**事件时间距离
+`|observed_at_i − observed_at_j| <= window_seconds`（窗口边界**含等号**）的**其他**
+有效读数（不含自身）。
+
+- 邻居**少于 3 条** → 不判定，计入 `insufficient_neighbors_count`；
+- 否则计算邻居取值的中位数 `local_median`，以及邻居对该中位数绝对偏差的中位数
+  `MAD = median(|v − local_median|)`（偶数个邻居取中间两值的算术平均）；
+- 当且仅当 `|value − local_median| > sensitivity * MAD`（**严格**大于）时标记为尖峰；
+  因此 `MAD = 0`（邻居取值完全相同）时，只有偏差严格大于零的读数才会被标记。
+
+响应中的 `spikes` 按 `(observed_at, seq)` 稳定排序，每项给出读数键 `key`
+（`observed_at`/`source_id`/`seq`）、`value`、`local_median`、`mad`、`deviation`；
+顶层给出回显的归一化参数与 `readings_count`（区间内已发布读数总数，先于有效值过滤）、
+`valid_count`（有效读数数）、`insufficient_neighbors_count`（邻居不足、未判定的有效读数数）。
+
+**200 条上限**：为保证二次邻居扫描始终廉价，区间内该来源的已发布读数（含随后被跳过的
+无效值读数）**超过 200 条**时直接返回 400，请收窄 `from`/`to` 后重试；恰好 200 条允许。
+
+**同一读快照、严格只读**：条数上限检查、读数读取与全部统计都在**同一个 deferred
+读事务（单一一致快照）**内完成，绝不写库，不推进水位线、不改变告警与检查点；其他事务
+未提交的插入对本次分析不可见。`open` 与 `closed` 会话均可分析。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/local-spikes?source_id=thermometer-a&from=2026-09-21T10:00:00Z&to=2026-09-21T11:00:00Z&window_seconds=60&sensitivity=3'
+```
+
+```json
+{
+  "session_id": "lab-1",
+  "source_id": "thermometer-a",
+  "from": "2026-09-21T10:00:00Z",
+  "to": "2026-09-21T11:00:00Z",
+  "window_seconds": 60.0,
+  "sensitivity": 3.0,
+  "value_key": null,
+  "readings_count": 5,
+  "valid_count": 5,
+  "insufficient_neighbors_count": 0,
+  "spikes": [
+    {
+      "key": {"observed_at": "2026-09-21T10:00:30Z", "source_id": "thermometer-a", "seq": 4},
+      "value": 50.0,
+      "local_median": 10.0,
+      "mad": 2.0,
+      "deviation": 40.0
+    }
+  ]
+}
+```
+
+- 错误码：会话不存在 → 404；缺少/非法 `source_id`、未声明来源、非法 `from`/`to`、
+  `from` 晚于 `to`、缺少/非正或非有限的 `window_seconds`/`sensitivity`、空白
+  `value_key`、区间内已发布读数超过 200 条 → 400。
+
 ## 数据库迁移
 
 建表采用“**幂等基础 schema + 版本化迁移**”：应用启动（FastAPI lifespan）时自动创建
@@ -979,6 +1067,7 @@ UTC 形式（如 `...T12:00:00+02:00` 回显为 `...T10:00:00Z`，不带时区�
 │   ├── source_gaps.py   # 来源缺口扫描：同一读快照内按来源找已发布相邻读数的超阈缺口（过滤+游标分页）
 │   ├── arrival_latency.py # 到达延迟剖析：同一读快照内按来源统计 first_received_at - observed_at 的样本数/min/max/avg
 │   ├── exposure.py       # 阈值暴露时长：同一读快照内计算来源在 [from,to) 严格高于阈值/有效覆盖/未知的秒数
+│   ├── local_spikes.py   # 局部尖峰：同一读快照内按闭区间与事件时间窗口用邻居中位数+MAD 严格判定尖峰（上限 200 条）
 │   ├── errors.py        # 400/404/409/422 业务异常
 │   ├── cursor.py        # 不透明 keyset 分页游标
 │   ├── database.py      # SQLite schema、版本化迁移、连接、BEGIN IMMEDIATE 事务
@@ -997,6 +1086,7 @@ UTC 形式（如 `...T12:00:00+02:00` 回显为 `...T10:00:00Z`，不带时区�
 │   └── test_source_gaps.py # 来源缺口扫描：相邻配对/严格阈值/微秒精度/闭区间/游标分页/400/只读测试（29 个）
 │   └── test_arrival_latency.py # 到达延迟剖析：逐来源统计/负延迟/微秒精度/闭区间/空来源/400/只读/单快照测试（19 个）
 │   └── test_exposure.py   # 阈值暴露时长：持有语义/起点继承/同刻 seq/未知区间/value_key/只看已发布/400/只读/单快照测试（47 个）
+│   └── test_local_spikes.py # 局部尖峰：中位数/MAD/严格判定/MAD 为零/邻居窗口与下限/闭区间/value_key/200 上限/400/只读/单快照测试（52 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

@@ -14,6 +14,7 @@ from . import (
     checkpoints,
     correlated,
     exposure,
+    local_spikes,
     quarantine_audit,
     release_plan,
     retention,
@@ -41,6 +42,7 @@ from .models import (
     CurrentAlertsResponse,
     CurrentCorrelatedAlertsResponse,
     ExposureResponse,
+    LocalSpikesResponse,
     PullResponse,
     QuarantineAuditResponse,
     QuarantineResponse,
@@ -65,7 +67,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lab Sensor Timeline Merge API",
-    version="1.10.0",
+    version="1.11.0",
     description=(
         "Out-of-order sensor reporting with per-session fixed source lists, "
         "a slowest-source watermark (minus allowed lateness), deterministic "
@@ -94,7 +96,13 @@ app = FastAPI(
         "a source's piecewise-constant published timeline inside a half-open "
         "[from, to) interval that are strictly above a threshold, alongside "
         "the valid-sample coverage and unknown seconds (missing, non-finite "
-        "and boolean values do not carry an older value over)."
+        "and boolean values do not carry an older value over). A read-only "
+        "local-spikes endpoint flags, in one snapshot, published readings in "
+        "an inclusive event-time interval whose finite value deviates from "
+        "the median of their in-window neighbours by strictly more than a "
+        "sensitivity coefficient times the neighbours' median absolute "
+        "deviation (MAD), skipping missing/non-finite/boolean values and "
+        "leaving readings with fewer than three neighbours undecided."
     ),
     lifespan=lifespan,
 )
@@ -396,6 +404,80 @@ def get_source_exposure(
             from_=from_,
             to=to,
             threshold=threshold,
+            value_key=value_key,
+        )
+    )
+
+
+@app.get(
+    "/sessions/{session_id}/local-spikes",
+    response_model=LocalSpikesResponse,
+    tags=["readings"],
+)
+def get_local_spikes(
+    session_id: str,
+    source_id: Optional[str] = Query(
+        None, description="One declared source of the session to analyse"
+    ),
+    from_: Optional[str] = Query(
+        None,
+        alias="from",
+        description="Inclusive event-time interval start (ISO 8601)",
+    ),
+    to: Optional[str] = Query(
+        None,
+        description="Inclusive event-time interval end (ISO 8601)",
+    ),
+    window_seconds: Optional[str] = Query(
+        None,
+        description=(
+            "Positive finite neighbour window in seconds: other valid readings"
+            " whose event-time distance is at most this are neighbours"
+        ),
+    ),
+    sensitivity: Optional[str] = Query(
+        None,
+        description=(
+            "Positive finite coefficient; flag when deviation is strictly"
+            " greater than sensitivity * MAD"
+        ),
+    ),
+    value_key: Optional[str] = Query(
+        None,
+        description="Top-level key read from object-valued readings (default: value itself)",
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> LocalSpikesResponse:
+    """Read-only local-spike analysis of one source's published readings.
+
+    Inside one SQLite read snapshot, the source's published readings in the
+    inclusive ``[from, to]`` interval are stably ordered by
+    ``(observed_at, seq)`` and only finite non-boolean numeric values
+    participate (an optional ``value_key`` names the top-level key read from
+    object values; missing and boolean values are skipped).  For each valid
+    reading the neighbours are the other valid readings whose event-time
+    distance is at most ``window_seconds``.  With fewer than three neighbours
+    the reading is not judged; otherwise its local median and the neighbours'
+    median absolute deviation (MAD) are computed and the reading is flagged
+    exactly when ``|value - median| > sensitivity * MAD`` -- strict even when
+    the MAD is zero.  The response lists each spike's key, value, local
+    median, MAD and deviation, plus the valid and undecided counts.  More
+    than 200 published readings in the interval returns 400.  Buffered and
+    quarantined readings never participate and nothing is written.  Invalid
+    interval/parameters or an unknown source return 400; an unknown session
+    returns 404.
+    """
+    # Every parameter error must be 400 (not FastAPI's default 422), so the
+    # query params are parsed/validated inside the module, like exposure.
+    return LocalSpikesResponse(
+        **local_spikes.local_spikes(
+            conn,
+            session_id,
+            source_id=source_id,
+            from_=from_,
+            to=to,
+            window_seconds=window_seconds,
+            sensitivity=sensitivity,
             value_key=value_key,
         )
     )
